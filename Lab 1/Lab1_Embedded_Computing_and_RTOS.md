@@ -168,6 +168,14 @@ There are several paths to update. `Ctrl+H` (Replace) with the old version as th
 > -- Build files have been written to: .../build/Debug
 > ```
 
+If you encounter a Ninja issue when cmd+shift+P on MAC, you may add the following line
+
+> cmake.configureEnvironment": {
+> "PATH": "/opt/ST//STM32CubeCLT_1.22.0/Ninja/bin:/opt/ST//STM32CubeCLT_1.22.0/GNU-tools-for-STM32/bin:${env:PATH}"
+> },
+
+to `.vscode/settings.json`.
+
 #### 4d. Select the configure preset
 
 CMake Tools may ask you to *"Select a Configure Preset"*. Choose **Debug**. If it instead asks you to *"Select a Kit"*, something is wrong with the paths from 4c — go back and check them.
@@ -323,7 +331,7 @@ You also need to include the header that declares `printf`. Find `/* USER CODE B
 /* USER CODE END Includes */
 ```
 
-**Now replace your printing code.** In the `while(1)` loop, delete the two `HAL_UART_Transmit` lines from 7a and put this in their place:
+**Now replace your printing code.** In the `while(1)` loop, delete the one `HAL_UART_Transmit` lines from 7a and put this in their place:
 
 ```c
     static uint32_t counter = 0;
