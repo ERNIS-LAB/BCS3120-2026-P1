@@ -9,8 +9,8 @@ We use the same development environment as in Labs 1–3: **VS Code with STM32Cu
 In Lab 4, you will need to finish 3 assignments. Here are the assignments:
 
 1. Deploy an MNIST network to STM32 with ONNX and ST Edge AI Developer Cloud
-2. Explore the optimization options of ST Edge AI Developer Cloud
-3. Classify camera snapshots with a pre-trained ImageNet network
+2. Explore the optimization options of ST Edge AI Developer Cloud on a pre-trained ImageNet network
+3. Classify camera snapshots with that network
 
 > After finishing each assignment, please ask the **course team** to check your implementation. You will be graded as **"complete" and get full grade** if all 3 assignments in the lab have been completed and checked.
 >
@@ -203,7 +203,7 @@ Two reasons:
 
 **This network does not need it.** The float weights are about 400 KB against 2 MB of flash. There is nothing to save here.
 
-Quantization is not a bad idea in general — it is one of the most effective things you can do to a network, and you will meet it properly in Assignment 3 with a model where 8-bit really is the difference between fitting and not fitting.
+Quantization is not a bad idea in general — it is one of the most effective things you can do to a network, and you will meet it properly in Assignment 2 with a model where 8-bit really is the difference between fitting and not fitting.
 
 > **Question:** an 8-bit weight takes a quarter of the space of a 32-bit one. Name one thing besides flash size that would also improve, and one thing that would get worse.
 
@@ -238,7 +238,7 @@ Run the optimization. When it finishes you get a report — read it, and record 
 
 > **Question:** the optimizer can change how much RAM the network needs, but it cannot change the MACC number at all. Why not? What would have to change for MACC to go down?
 
-Assignment 2 is entirely about this step. For now, take the balanced option and move on — you will come back and try the others there.
+Assignment 2 is entirely about this step. For now, take the balanced option and move on — you will try the others there, on a much larger network where the choice actually makes a difference.
 
 #### 2g. Benchmark on a real board
 
@@ -632,13 +632,93 @@ Look at the memory table from this build as well, and compare it with the one yo
 
 In Assignment 1 you took the balanced optimization setting without asking what the alternatives were. This assignment is about finding out.
 
-You will not write any C code in this assignment. The work is running the same model through the tool three times with different settings, benchmarking each one on a real board, and building a table you can reason about. That is a normal part of deploying a model, and it is a skill worth practising: the tool gives you knobs, and somebody has to decide which position to leave them in.
+You will not explore them on the MNIST network, because it is too small to show you anything. It has two weight layers and a single intermediate result — 128 values — between them. The optimization setting decides how intermediate results share memory, and with only one of them there is nothing to decide. All three settings come out the same.
 
-### Step 1: What the optimization setting actually controls
+So you will use a network where the choice is real: **MobileNet v1**, trained on **ImageNet**, the network you will run on camera pictures in Assignment 3. By the end of this assignment you will know what that network is, you will have seen what the tool can do with it, and you will have downloaded the C code that Assignment 3 needs.
 
-When a network runs, its layers produce intermediate results. Layer 1 of your MNIST network produces 128 hidden values; the ReLU then overwrites them; Layer 2 reads them and produces 10 outputs. Every one of those intermediate results needs somewhere to live while it is being used, and that somewhere is the **activations buffer** you allocated in Assignment 1.
+You will not write any C code in this assignment. The work is understanding the model, running it through the tool three times with different settings, benchmarking each one on a real board, and building a table you can reason about. That is a normal part of deploying a model, and it is a skill worth practising: the tool gives you knobs, and somebody has to decide which position to leave them in.
 
-The code generator has a choice to make about that buffer. It can:
+### Step 1: Get to know the network
+
+This time you do not bring your own model. ST publishes a library of networks that are already trained, already quantized, and already known to work on their hardware, and you will take one from there.
+
+#### 1a. Find the model
+
+Go to <https://stedgeai-dc.st.com>, sign in, and instead of uploading a file, browse the **model zoo**. Find:
+
+```
+MOBILENET_A050_PT_224_QDQ_INT8_IMAGE_CLASSIFICATION_IMAGENET.ONNX
+```
+
+The name is long but every part of it tells you something, and you should be able to read it:
+
+| Part | Meaning |
+| ---- | ------- |
+| `MOBILENET` | The architecture — a convolutional network designed for phones and embedded devices |
+| `A050` | The **width multiplier**, α = 0.50. Every layer has half as many channels as the full-size version |
+| `PT` | Exported from **PyTorch** |
+| `224` | Input images are 224×224 pixels |
+| `QDQ_INT8` | Already **quantized** to 8-bit integers |
+| `IMAGE_CLASSIFICATION_IMAGENET` | The task and the dataset it was trained on |
+
+ImageNet is a dataset of 1.2 million photographs in 1000 categories. The network takes one 224×224 colour picture and produces 1000 scores, one per category.
+
+#### 1b. Why this model and not a bigger one
+
+MobileNet comes in several widths. The width multiplier scales the number of channels in every layer, and because a convolution's weight count depends on input channels × output channels, halving α cuts the weights by roughly **four times**, not two.
+
+Here is what that means for this board, which has 2 MB of flash and 768 KB of RAM. In Assignment 3 the camera will need a 150 KB frame buffer as well, so that has to fit too:
+
+| Width | Weights (int8) | Activations | Fits alongside a 150 KB frame buffer? |
+| ----- | -------------- | ----------- | ------------------------------------- |
+| α = 0.25 | ~0.47 MB | ~270 KB | Comfortably |
+| **α = 0.50** | **~1.3 MB** | **~420 KB** | **Yes, with roughly a quarter of the RAM to spare** |
+| α = 1.00 | ~4.2 MB | ~590 KB | No — the weights alone are twice the flash |
+
+The trade is accuracy. α = 0.25 scores around 50% top-1 on ImageNet, α = 0.50 around 64%, α = 1.00 around 71%. You are taking the largest model that comfortably fits.
+
+> **Question:** the weight count scales roughly with α², but not exactly. The final layer maps the last feature vector to 1000 class scores, and *its* weights scale with α directly. Why? And at α = 0.25, what fraction of the whole network would that single layer be?
+
+> **Question:** this network is right roughly two times in three. Given that, why will it make more sense in Assignment 3 to print the **top five** classes rather than only the best one?
+
+#### 1c. It arrives already quantized
+
+In Assignment 1 you skipped quantization because the network did not need it. Here you skip it because **it has already been done**. That is what `QDQ_INT8` in the file name means: the model arrives with 8-bit weights and with the scale factors needed to interpret them.
+
+This matters for Assignment 3, so be clear about what quantization actually is.
+
+A trained network's weights and activations are real numbers, typically in a range like −3 to +3. An 8-bit integer can only hold 256 distinct values. Quantization picks a **scale** and a **zero point** that map the real range onto those 256 slots:
+
+```
+real value  ≈  scale × (integer value − zero point)
+```
+
+Going the other way, to turn a real number into its 8-bit representation:
+
+```
+integer value  =  round(real value / scale)  +  zero point
+```
+
+The `network.h` you download at the end of this assignment will contain the two constants for this model's input:
+
+```c
+#define STAI_NETWORK_IN_1_SCALE       (0.01865844801068306f)
+#define STAI_NETWORK_IN_1_ZERO_POINT  (-14)
+```
+
+In Assignment 3 you will use exactly that second formula to turn camera pixels into something the network can accept.
+
+Being 8-bit is also why this network fits at all. The same weights stored as 32-bit floats would be four times larger — about 5.4 MB, against 2 MB of flash.
+
+> **Question:** with a scale of 0.018658 and a zero point of −14, what real value does the integer −128 represent? And +127? Those two numbers are the entire range of real values this network can see at its input.
+
+### Step 2: What the optimization setting actually controls
+
+When a network runs, its layers produce intermediate results. Every one of those intermediate results needs somewhere to live while it is being used, and that somewhere is the **activations buffer** you allocated in Assignment 1.
+
+For your MNIST network this was trivial: one intermediate result of 128 floats, 512 bytes. MobileNet is a stack of 27 convolution layers, and each one produces a **feature map** — for the early layers, a 112×112 image with dozens of channels, tens or hundreds of kilobytes apiece. Most of those feature maps are only needed for one or two layers and then never again.
+
+The code generator has a choice to make about all of that. It can:
 
 - **give every intermediate result its own space**, which is simple and fast but needs more RAM, or
 - **reuse the same space for several results** whose lifetimes do not overlap, which needs less RAM but may cost extra copying or force a less convenient memory layout.
@@ -653,11 +733,17 @@ That is the trade-off the optimization setting controls. The tool offers you rou
 
 > The exact wording on the page may differ from these three names. What matters is that one option favours speed, one favours memory, and one sits between them.
 
-> **Question — predict before you measure.** Write down, now, what you expect to happen to each of these four numbers as you move from the RAM setting to the inference time setting: **MACC**, **weights in flash**, **activations RAM**, **inference time**. Say which ones you expect to change and in which direction, and which you expect not to change at all. Keep what you wrote — you will check it against your table at the end of Step 2.
+> **Question — predict before you measure.** Write down, now, what you expect to happen to each of these four numbers as you move from the RAM setting to the inference time setting: **MACC**, **weights in flash**, **activations RAM**, **inference time**. Say which ones you expect to change and in which direction, and which you expect not to change at all. Keep what you wrote — you will check it against your table at the end of Step 3.
 
-### Step 2: Generate and benchmark each setting
+### Step 3: Optimize and benchmark each setting
 
-Go back to <https://stedgeai-dc.st.com> and upload `mlp_mnist.onnx` again, exactly as in Assignment 1 Step 2. Use **ST Edge AI Core 4.0.1**, platform **STM32 MCUs**, board **B-U585I-IOT02A**, and skip quantization again.
+With the model selected, set up the target exactly as in Assignment 1:
+
+- Platform family: **STM32 MCUs**
+- Series **STM32U5**, board **B-U585I-IOT02A**
+- Code generator: **ST Edge AI Core 4.0.1**
+
+**Skip the quantization step** — Step 1c explains why.
 
 Now repeat this loop **three times**, once per optimization setting:
 
@@ -666,7 +752,7 @@ Now repeat this loop **three times**, once per optimization setting:
 3. Go to the benchmark step, make sure the board is **B-U585I-IOT02A**, and run it.
 4. Record the **measured inference time**.
 
-> **Benchmarks are queued.** Three runs, times thirty students, is a lot of jobs. Start each benchmark and read ahead while it runs rather than watching the page. If the queue is long, run the benchmarks for all three settings first and fill in the table as results arrive.
+> **Benchmarks are queued.** Three runs, times thirty students, is a lot of jobs — and each of these runs takes seconds on the board rather than milliseconds. Start each benchmark and read ahead while it runs rather than watching the page. If the queue is long, start the benchmarks for all three settings first and fill in the table as results arrive.
 
 Fill this in:
 
@@ -676,7 +762,27 @@ Fill this in:
 | Balanced | | | | |
 | Inference time | | | | |
 
-> **Check:** the **MACC** column should be identical on all three rows, and so should the **weights** column. If either of them changes, you have accidentally changed something else as well — most likely you quantized one of the runs. Start that row again.
+> **Compare your MACC figure with your MNIST network's 101 898.** How many times more arithmetic is one classification with this network? Your MNIST inference took a few milliseconds. If you had scaled that time by the same ratio, what would you have predicted for this network — and how close is your measured time to that prediction?
+
+Now look at your table and at the prediction you wrote in Step 2.
+
+> **Questions to work out and discuss with the course team:**
+>
+> 1. Which columns changed across the three settings and which did not? Did that match your prediction?
+> 2. Look at the MACC column across the three settings. Explain what you see: why could, or could not, an optimizer that rearranges memory change this number?
+> 3. In Assignment 3 this network has to share 768 KB of RAM with a 150 KB camera frame buffer, plus a few kilobytes for everything else. Which of your three settings would fit? Which would you choose, and why?
+
+### Step 4: Download the C code for Assignment 3
+
+Go back to the optimize step, select **balanced** again, make sure the board is still **B-U585I-IOT02A**, and choose **Download C code**. Take the C code, not a full STM32CubeIDE project.
+
+Use **balanced** even if another setting looked better in your table. The expected output and memory figures in Assignment 3 are written for the balanced setting, and you want to get the program working against known numbers first. Once it works, trying another setting is a matter of swapping the generated files.
+
+> **Check:** the zip contains `network.c`, `network.h`, `network_data.c`, `network_data.h`, `network_details.c`, an `Inc/` folder of headers, and a `Lib/` folder with a `NetworkRuntime*_CM33_GCC.a`.
+>
+> `network_data.c` is a large file this time — it holds 1.3 MB of weights.
+
+**Keep this zip.** It is the first thing you need in Assignment 3.
 
 > **(Check with the course team when you finish this assignment)**
 
@@ -688,10 +794,12 @@ So far the network has been small, the input has come from a header file, and th
 
 You will run **MobileNet v1 with a width multiplier of 0.5**, trained on **ImageNet** — a dataset of 1.2 million photographs in 1000 categories — on pictures you take yourself with the camera from Lab 2. Press the USER button, the board takes one photo, classifies it, and prints the five categories it thinks are most likely.
 
-The network is roughly 1500 times more work per inference than your MNIST model and uses three times the weights. It only fits on this board because of two decisions that were made before you got here, and understanding both is most of the point of this assignment:
+You met this network in Assignment 2 and downloaded its C code at the end of it. Keep that zip to hand — you need it in Step 2.
 
-- Its weights are **8-bit integers** rather than 32-bit floats, which is the difference between 1.3 MB and 5.4 MB of flash.
-- The camera runs at **320×240** rather than the 640×480 you used in Lab 2, which is the difference between 150 KB and 600 KB of RAM for the frame buffer.
+The network is roughly 1500 times more work per inference than your MNIST model and uses three times the weights. It only fits on this board because of two decisions, and understanding both is most of the point of this assignment:
+
+- Its weights are **8-bit integers** rather than 32-bit floats, which is the difference between 1.3 MB and 5.4 MB of flash. You saw why in Assignment 2 Step 1c.
+- The camera runs at **320×240** rather than the 640×480 you used in Lab 2, which is the difference between 150 KB and 600 KB of RAM for the frame buffer. You will see why in Step 3b.
 
 **Before you start:** make a copy of your Assignment 1 project folder and call it `lab4_assignment1`, if you have not already. Assignment 3 uses a different project entirely, so nothing here will overwrite your earlier work — but you hand each assignment in separately.
 
@@ -720,7 +828,7 @@ This is your Lab 2 camera project with four changes:
 | Change | Why |
 | ------ | --- |
 | `CMakeLists.txt` has the **X-CUBE-AI block** added, with `CONFIGURE_DEPENDS` | Same block as Assignment 1 — it compiles and links whatever you put in `X-CUBE-AI/` |
-| `X-CUBE-AI/App`, `Inc`, `Lib` exist and are **empty** | You fill them in Step 3 |
+| `X-CUBE-AI/App`, `Inc`, `Lib` exist and are **empty** | You fill them in Step 2 |
 | **`Core/Inc/imagenet_labels.h`** is new | The 1000 ImageNet category names, as a C array |
 | **USART1 is configured and `printf` works** | Lab 2 read results with the debugger. Here you need readable text, so `__io_putchar` is hooked up and `-u _printf_float` is in `CMakeLists.txt` |
 
@@ -744,113 +852,17 @@ Note the `const` — for the same reason as in Lab 3, these 20 KB of strings liv
 
 Connect the board to **CN8**, build with **Ctrl+Shift+B**, flash with **Run Task → Flash**, and open the **Serial Monitor** at **115200 baud**.
 
-> **Check:** you see a startup banner over the serial port. That is the new part — in Lab 2 this project printed nothing at all.
+> **Check:** the project builds and flashes without errors.
 >
-> If you see nothing, check the baud rate first. If you see garbage characters, the baud rate is wrong rather than the program.
-
-### Step 2: Get the model from the ST model zoo
-
-This time you do not bring your own model. ST publishes a library of networks that are already trained, already quantized, and already known to work on their hardware, and you will take one from there.
-
-#### 2a. Find the model
-
-Go to <https://stedgeai-dc.st.com>, sign in, and instead of uploading a file, browse the **model zoo**. Find:
-
-```
-MOBILENET_A050_PT_224_QDQ_INT8_IMAGE_CLASSIFICATION_IMAGENET.ONNX
-```
-
-The name is long but every part of it tells you something, and you should be able to read it:
-
-| Part | Meaning |
-| ---- | ------- |
-| `MOBILENET` | The architecture — a convolutional network designed for phones and embedded devices |
-| `A050` | The **width multiplier**, α = 0.50. Every layer has half as many channels as the full-size version |
-| `PT` | Exported from **PyTorch** |
-| `224` | Input images are 224×224 pixels |
-| `QDQ_INT8` | Already **quantized** to 8-bit integers |
-| `IMAGE_CLASSIFICATION_IMAGENET` | The task and the dataset it was trained on |
-
-#### 2b. Why this model and not a bigger one
-
-MobileNet comes in several widths. The width multiplier scales the number of channels in every layer, and because a convolution's weight count depends on input channels × output channels, halving α cuts the weights by roughly **four times**, not two.
-
-Here is what that means for this board, which has 2 MB of flash and 768 KB of RAM:
-
-| Width | Weights (int8) | Activations | Fits alongside a 150 KB frame buffer? |
-| ----- | -------------- | ----------- | ------------------------------------- |
-| α = 0.25 | ~0.47 MB | ~270 KB | Comfortably |
-| **α = 0.50** | **~1.3 MB** | **~420 KB** | **Yes, with roughly a quarter of the RAM to spare** |
-| α = 1.00 | ~4.2 MB | ~590 KB | No — the weights alone are twice the flash |
-
-The trade is accuracy. α = 0.25 scores around 50% top-1 on ImageNet, α = 0.50 around 64%, α = 1.00 around 71%. You are taking the largest model that comfortably fits.
-
-> **Question:** the weight count scales roughly with α², but not exactly. The final layer maps the last feature vector to 1000 class scores, and *its* weights scale with α directly. Why? And at α = 0.25, what fraction of the whole network would that single layer be?
-
-> **Question:** you are about to run a network that is right roughly two times in three. Given that, why does printing the **top five** classes make more sense than printing only the best one?
-
-#### 2c. Select the platform, board and version
-
-Exactly as in Assignment 1:
-
-- Platform family: **STM32 MCUs**
-- Series **STM32U5**, board **B-U585I-IOT02A**
-- Code generator: **ST Edge AI Core 4.0.1**
-
-#### 2d. Skip the quantization step again — but for a different reason
-
-In Assignment 1 you skipped quantization because the network did not need it. Here you skip it because **it has already been done**. That is what `QDQ_INT8` in the file name means: the model arrives with 8-bit weights and with the scale factors needed to interpret them.
-
-This matters for the rest of the assignment, so be clear about what quantization actually is.
-
-A trained network's weights and activations are real numbers, typically in a range like −3 to +3. An 8-bit integer can only hold 256 distinct values. Quantization picks a **scale** and a **zero point** that map the real range onto those 256 slots:
-
-```
-real value  ≈  scale × (integer value − zero point)
-```
-
-Going the other way, to turn a real number into its 8-bit representation:
-
-```
-integer value  =  round(real value / scale)  +  zero point
-```
-
-Your generated `network.h` will contain the two constants for this model's input:
-
-```c
-#define STAI_NETWORK_IN_1_SCALE       (0.01865844801068306f)
-#define STAI_NETWORK_IN_1_ZERO_POINT  (-14)
-```
-
-You will use exactly that second formula in Step 4 to turn camera pixels into something the network can accept.
-
-> **Question:** with a scale of 0.018658 and a zero point of −14, what real value does the integer −128 represent? And +127? Those two numbers are the entire range of real values this network can see at its input.
-
-#### 2e. Optimize and benchmark
-
-Run the optimize step with the **balanced** setting, as in Assignment 1, and record the report:
-
-| Quantity | Expected | Your value |
-| -------- | -------- | ---------- |
-| MACC | about 149 600 000 | |
-| Weights (ROM) | about 1 345 000 bytes | |
-| Activations (RAM) | about 421 000 bytes | |
-
-> **Compare that MACC figure with your MNIST network's 101 898.** It is roughly 1500 times more arithmetic for one classification. Write down what that suggests about the inference time before you measure it — your MNIST inference took a few milliseconds.
-
-Then run the **benchmark** on **B-U585I-IOT02A** and record the measured inference time.
-
-#### 2f. Download the C code
-
-Make sure the board is still **B-U585I-IOT02A**, then choose **Download C code**. Take the C code, not a full STM32CubeIDE project.
-
-> **Check:** the zip contains `network.c`, `network.h`, `network_data.c`, `network_data.h`, `network_details.c`, an `Inc/` folder of headers, and a `Lib/` folder with a `NetworkRuntime*_CM33_GCC.a`.
+> **The Serial Monitor stays empty, and that is correct.** The UART is set up and `printf` is ready to use, but nothing in `main.c` prints anything yet. The first text you see from this board will be the model information in Step 3i.
 >
-> `network_data.c` is a large file this time — it holds 1.3 MB of weights.
+> Leave the Serial Monitor open at 115200 baud anyway, so it is ready when you get there.
 
-### Step 3: Put the generated code into the project
+### Step 2: Put the generated code into the project
 
-#### 3a. Copy the files
+Use the zip you downloaded at the end of **Assignment 2 Step 4** — the **balanced** setting. If you did not keep it, go back to the Developer Cloud and download it again; everything in this assignment assumes that exact package.
+
+#### 2a. Copy the files
 
 Same layout as Assignment 1:
 
@@ -860,7 +872,7 @@ Same layout as Assignment 1:
 | everything in `Inc/` | `X-CUBE-AI/Inc/` |
 | the `.a` file from `Lib/` | `X-CUBE-AI/Lib/` |
 
-#### 3b. Build
+#### 2b. Build
 
 Build now, before writing any code.
 
@@ -868,11 +880,11 @@ Because nothing calls the network yet, the linker discards it and the memory tab
 
 > **If the build fails with `undefined reference to stai_runtime_init`**, CMake has not picked up the new files. Run **CMake: Delete Cache and Reconfigure** from the Command Palette.
 
-### Step 4: The code, block by block
+### Step 3: The code, block by block
 
 This is a longer program than Assignment 1, so it is built up in pieces. Copy each block into the place indicated and read the explanation — you will be asked about these.
 
-#### 4a. Includes and definitions
+#### 3a. Includes and definitions
 
 In `USER CODE Includes`, add to what is already there:
 
@@ -913,7 +925,7 @@ The camera gives you a 320×240 frame. The network wants 224×224. `CROP` is the
 
 > **Question:** why take a square crop at all, rather than squashing the whole 320×240 frame down to 224×224? Think about what a picture of a round object would look like after each.
 
-#### 4b. The buffers
+#### 3b. The buffers
 
 In `USER CODE PV`, replacing the `CameraBuf` line that is already there:
 
@@ -931,11 +943,11 @@ static stai_network network_context[STAI_NETWORK_CONTEXT_SIZE] = {0};
 STAI_ALIGNED(STAI_NETWORK_ACTIVATION_1_ALIGNMENT)
 static uint8_t activations[STAI_NETWORK_ACTIVATION_1_SIZE_BYTES];
 
-/* These point INSIDE the activations buffer - see 4d */
+/* These point INSIDE the activations buffer - see 3d */
 static int8_t *nn_in  = NULL;
 static int8_t *nn_out = NULL;
 
-/* Quantisation lookup tables, built once at startup - see 4e */
+/* Quantisation lookup tables, built once at startup - see 3e */
 static int8_t qlut_r[32];
 static int8_t qlut_g[64];
 static int8_t qlut_b[32];
@@ -961,7 +973,7 @@ The reason is arithmetic. The input tensor is 224 × 224 × 3 = **150 528 bytes*
 
 > **Question:** in Assignment 1 the input tensor was 3136 bytes and you allocated your own. Here it is 150 528 and you do not. State the rule you would give someone else for choosing between the two approaches.
 
-#### 4c. The camera frame callback
+#### 3c. The camera frame callback
 
 This one is **already in the project**, left over from Lab 2. Find it in `USER CODE 0` and check it is still there:
 
@@ -972,7 +984,7 @@ void BSP_CAMERA_FrameEventCallback(uint32_t Instance)
 }
 ```
 
-Three lines, but how they work is worth being precise about, because your loop in Step 5 depends on it.
+Three lines, but how they work is worth being precise about, because your loop in Step 4 depends on it.
 
 `BSP_CAMERA_Start` does **not** wait for a photograph. It tells the DCMI peripheral and the DMA controller to start filling `CameraBuf`, then returns immediately while the transfer carries on in the background. Something has to tell you when the frame is actually complete, and this function is that something.
 
@@ -996,7 +1008,7 @@ Two details matter.
 
 > **Question:** the callback takes an `Instance` argument that this code ignores. What would it be for, and why is it always 0 on this board?
 
-#### 4d. Initialization
+#### 3d. Initialization
 
 In `USER CODE 0`:
 
@@ -1054,7 +1066,7 @@ The first three calls are identical to Assignment 1. The difference is what foll
 
 **The quantization constants come from `network.h`, not from a function call.** There is an API call named `stai_network_get_info` that would also report them, but in the generated `network.c` it sits behind `#if defined(HAVE_NETWORK_INFO)` and is not compiled in by default. Trying to call it gives you a linker error about an undefined reference. The macros are always there, cost nothing at runtime, and are visible in your source — use them.
 
-#### 4e. The quantization lookup tables
+#### 3e. The quantization lookup tables
 
 Also in `USER CODE 0`, above `ai_init`:
 
@@ -1099,7 +1111,7 @@ Every pixel that goes into the network has to travel through four conversions:
 1. **5 or 6 bits to 8 bits.** An RGB565 pixel stores red in 5 bits, green in 6, blue in 5. Shifting left and copying the top bits down into the empty places spreads the value across the full 0–255 range. This is the same expansion you did in Lab 2.
 2. **0–255 to 0.0–1.0.** Divide by 255.
 3. **ImageNet normalisation.** Subtract the mean and divide by the standard deviation of each colour channel across the ImageNet training set. The model was trained on inputs treated this way, so it expects them.
-4. **Quantise to int8**, with the formula from Step 2d.
+4. **Quantise to int8**, with the formula from Assignment 2 Step 1c.
 
 Doing all four for every pixel would mean 150 528 float divisions per photo, at a moment when you are already asking the board to do 150 million multiply-accumulates.
 
@@ -1109,7 +1121,7 @@ But notice: an RGB565 red channel has only **32 possible values**. Green has 64.
 
 > **Question:** this is the same idea as Assignment 3 of Lab 3 — doing work once instead of many times. Name the difference between the two: in Lab 3 you moved data to make repeated reads cheaper, and here you do something else. What?
 
-#### 4f. Camera frame to input tensor
+#### 3f. Camera frame to input tensor
 
 ```c
 static void camera_to_tensor(const uint32_t *cam, int8_t *dst)
@@ -1152,7 +1164,7 @@ Three things are happening in this one pass.
 
 **Resizing.** `(x * CROP) / NN_W` maps output column `x` to a source column in the 240-wide crop. This is **nearest-neighbour** resizing: for each output pixel, pick the closest input pixel and use it unchanged. It is the cheapest method there is and perfectly adequate here.
 
-**Colour conversion and quantisation**, via the three lookup tables from 4e.
+**Colour conversion and quantisation**, via the three lookup tables from 3e.
 
 The one part that needs explaining is the layout of the output. Look at where the three colours go:
 
@@ -1173,7 +1185,7 @@ Models exported from PyTorch are usually channel-first. Models from TensorFlow a
 
 > **This is the mistake that costs the most time in this assignment.** Both layouts compile, both run, and both produce ten plausible-looking class names. Only one of them is right. If your predictions look like confident nonsense that does not change much when you point the camera somewhere else, check this first.
 
-#### 4g. Printing the top five
+#### 3g. Printing the top five
 
 ```c
 static void print_top5(const int8_t *out, uint32_t ms)
@@ -1219,7 +1231,7 @@ Two details worth noticing.
 
 **The class index is printed as well as the name.** `[954]` next to `banana` lets you check the label file directly when a result looks wrong.
 
-#### 4h. The button
+#### 3h. The button
 
 ```c
 static void button_init(void)
@@ -1244,7 +1256,7 @@ static int button_pressed(void)
 
 The USER button is on **PC13**. Rather than assuming whether pressing it drives the pin high or low, `button_init` reads the pin once at startup and remembers that level as "not pressed". `button_pressed` then reports any *change* from it. The code works either way round, and you never have to look the wiring up.
 
-#### 4i. Setup in `main`
+#### 3i. Setup in `main`
 
 In `USER CODE 2`, replacing the camera setup that is already there from Lab 2:
 
@@ -1300,9 +1312,9 @@ Build and flash now, before writing the loop.
 > ready - press the USER button
 > ```
 >
-> Compare `MACC` and `weights` with what the Developer Cloud reported in Step 2e.
+> Compare `MACC` and `weights` with the balanced row of your table in Assignment 2 Step 3.
 
-### Step 5: Write the loop
+### Step 4: Write the loop
 
 Everything is ready. The loop goes in `USER CODE WHILE` — the body of `while(1)` — because unlike every earlier lab this program waits for the user and runs again each time.
 
@@ -1359,7 +1371,7 @@ Everything is ready. The loop goes in `USER CODE WHILE` — the body of `while(1
 > **Hints:**
 >
 > - `HAL_GetTick()` returns milliseconds since startup. Use it rather than `TIM2->CNT` here: this inference takes seconds, and TIM2's 32-bit cycle counter wraps around every 26.8 seconds.
-> - Step 2's "wait until released" is a `while` loop with an empty body: `while (button_pressed()) { }`.
+> - Part 2's "wait until released" is a `while` loop with an empty body: `while (button_pressed()) { }`.
 > - The LED is active low on this board, so `GPIO_PIN_RESET` turns it **on**.
 > - `camera_to_tensor` writes straight into `nn_in`, which points inside the activations buffer. There is no copy afterwards — the network reads what you just wrote.
 
@@ -1383,7 +1395,7 @@ Everything is ready. The loop goes in `USER CODE WHILE` — the body of `while(1
 > }
 > ```
 
-### Step 6: Check your results
+### Step 5: Check your results
 
 Build, flash, open the Serial Monitor, point the camera at something, and press the USER button.
 
@@ -1410,17 +1422,17 @@ Build, flash, open the Serial Monitor, point the camera at something, and press 
 | What you see | Most likely cause |
 | ------------ | ----------------- |
 | Link fails: `undefined reference to stai_runtime_init` | CMake has not picked up the generated files. **Delete Cache and Reconfigure** |
-| Link fails: `undefined reference to stai_network_get_info` | You called it. It is not compiled in — use the `network.h` macros instead (Step 4d) |
+| Link fails: `undefined reference to stai_network_get_info` | You called it. It is not compiled in — use the `network.h` macros instead (Step 3d) |
 | Build fails: `region RAM overflowed` | `CameraBuf` is still sized for 640×480, or you declared your own input buffer as well as using `get_inputs` |
 | Nothing happens on the **very first** press | `button_init()` was not called, or the button is not on PC13 on your board — check with the course team |
-| The **first** press works, the **second** does nothing | `BSP_CAMERA_Stop(0)` is missing after the frame wait. The program is stuck in `while (frameFlag == 0)` — see Step 5 |
-| One press gives several classifications | The debounce and release-wait in Step 5 part 2 are missing |
+| The **first** press works, the **second** does nothing | `BSP_CAMERA_Stop(0)` is missing after the frame wait. The program is stuck in `while (frameFlag == 0)` — see Step 4 |
+| One press gives several classifications | The debounce and release-wait in part 2 of the Step 4 template are missing |
 | Crash or hard fault on the first photo | `BSP_CAMERA_Init` is still at `CAMERA_R640x480` while `CameraBuf` is sized for QVGA |
-| The same few classes every time, regardless of what you point at | The channel layout is wrong — see the warning in Step 4f |
+| The same few classes every time, regardless of what you point at | The channel layout is wrong — see the warning in Step 3f |
 | Everything plausible but consistently poor | The one-second settle delay is missing, so the exposure is wrong |
 | Class names look shifted — the right *idea* but the wrong word | The label file has 1001 entries and the model 1000, or the reverse. Check `NN_CLS` against `IMAGENET_NUM_CLASSES` |
 
-### Step 7: Look at what it cost
+### Step 6: Look at what it cost
 
 Scroll back to the memory table from your build.
 
@@ -1448,7 +1460,7 @@ Now put this assignment next to the rest of the course.
 > 2. In **Lab 3 Assignment 3** you made the MNIST inference faster by copying the weights from flash into SRAM. Work out whether you could do the same here: add the weight size to the RAM figure above and compare with 768 KB. What does your answer say about when that optimisation is available at all?
 > 3. `MX_ICACHE_Init()` is called in this project. Given your answer to question 2, what job is the instruction cache doing on every inference, and why does it matter more here than in any earlier lab?
 > 4. This inference takes a few seconds. Suppose the board had to classify a live video stream at 10 frames per second instead. Name three different changes you could make, and say what each one costs you.
-> 5. The preprocessing in Step 4e and 4f runs on the same processor as the network. Time it separately by putting a `HAL_GetTick()` either side of `camera_to_tensor`. What fraction of the total is it? Was the lookup table worth building?
+> 5. The preprocessing in Step 3e and 3f runs on the same processor as the network. Time it separately by putting a `HAL_GetTick()` either side of `camera_to_tensor`. What fraction of the total is it? Was the lookup table worth building?
 > 6. You have now deployed two networks with the same tool and the same seven API calls — one of 101 898 MACC and one of 149 603 912. Name one thing that was harder about the second that had nothing to do with the network being bigger.
 
 > **(Check with the course team when you finish this assignment)**
